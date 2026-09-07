@@ -83,7 +83,7 @@ TIME_RE = re.compile(r"(\d{1,2}[:.]\d{2})\s*[-–—]\s*(\d{1,2}[:.]\d{2})")
 # ---- разбор .docx-таблицы расписания ----------------------------------
 TYPE_MARKERS_RE = re.compile(r"(Лек\.|Лаб\.|Пр\.|Сем\.|Конс\.|МК\.|ПК\.?)", re.IGNORECASE)
 DATE_TOKEN_RE = re.compile(r"\b(\d{1,2})\.(\d{1,2})\b")
-ROOM_RE = re.compile(r"ауд\.?\s*([^,]*)", re.IGNORECASE)
+ROOM_RE = re.compile(r"ауд\.?\s*([^\s,]+)", re.IGNORECASE)
 URLSAFE_RE = re.compile(r"^[A-Za-z0-9\-_./?=&%:]+$")
 DATE_IN_CAPTION_RE = re.compile(r"(\d{1,2})[.\-/](\d{1,2})")
 
@@ -302,26 +302,18 @@ def _entry_dates(text: str) -> list[str]:
     return sorted({f"{int(dd):02d}.{int(mm):02d}" for dd, mm in DATE_TOKEN_RE.findall(text)})
 
 
-def _parse_cell(cell) -> dict | None:
-    paragraphs = [p.text for p in cell.paragraphs]
-    url, rest = _extract_url(paragraphs)
-    rest = [t for t in rest if not MEETING_NOTE_RE.search(t)]
-    if not rest:
+def _strip_room(text: str) -> tuple[str, str]:
+    """Возвращает (аудитория_из_первого_упоминания, текст_без_ВСЕХ_упоминаний_аудитории)."""
+    m = ROOM_RE.search(text)
+    room = m.group(1).strip(" .") if m else ""
+    return room, ROOM_RE.sub("", text)
+
+
+def _parse_single_variant(combined: str, url: str | None) -> dict | None:
+    if not combined.strip():
         return None
-
-    dates = _entry_dates(" ".join(rest))
-
-    # аудиторию ищем в пределах ОДНОГО абзаца, чтобы случайно не "утащить"
-    # в неё текст из соседних, не связанных с ней абзацев
-    room = ""
-    for idx, t in enumerate(rest):
-        m = ROOM_RE.search(t)
-        if m:
-            room = m.group(1).strip(" .")
-            rest[idx] = (t[: m.start()] + t[m.end():]).strip(" ,")
-            break
-
-    text_wo_room = " ".join(x for x in rest if x)
+    dates = _entry_dates(combined)
+    room, text_wo_room = _strip_room(combined)
     clean = TYPE_MARKERS_RE.sub("", text_wo_room)
     clean = DATE_TOKEN_RE.sub("", clean)
     clean = re.sub(r"[ ,]{2,}", " ", clean).strip(" ,")
@@ -338,6 +330,64 @@ def _parse_cell(cell) -> dict | None:
         "url": url,
         "dates": dates,
     }
+
+
+def _parse_cell(cell) -> list[dict]:
+    """
+    Разбирает ячейку с одной парой одной группы. Обычно там один вариант
+    (предмет + викладач + аудиторія), но иногда в одной ячейке склеено
+    сразу несколько — например, "Лек." на одних датах и "Пр." на других,
+    каждая со своей аудиторией. В этом случае возвращает несколько
+    отдельных записей (по одной на вариант), с общим предметом и, если у
+    варианта не указан свой викладач — с викладачем, найденным в другом
+    варианте той же ячейки.
+    """
+    paragraphs = [p.text for p in cell.paragraphs]
+    url, rest = _extract_url(paragraphs)
+    rest = [t for t in rest if not MEETING_NOTE_RE.search(t)]
+    if not rest:
+        return []
+
+    combined = " ".join(rest)
+    marker_matches = list(TYPE_MARKERS_RE.finditer(combined))
+
+    if len(marker_matches) <= 1:
+        entry = _parse_single_variant(combined, url)
+        return [entry] if entry else []
+
+    subject_text = combined[: marker_matches[0].start()].strip(" ,.-")
+    bounds = [m.start() for m in marker_matches] + [len(combined)]
+    segments = [combined[bounds[i]: bounds[i + 1]] for i in range(len(bounds) - 1)]
+
+    parsed_segments = []
+    for seg in segments:
+        dates = _entry_dates(seg)
+        room, text_wo_room = _strip_room(seg)
+        clean = TYPE_MARKERS_RE.sub("", text_wo_room)
+        clean = DATE_TOKEN_RE.sub("", clean)
+        clean = re.sub(r"[ ,]{2,}", " ", clean).strip(" ,")
+        parsed_segments.append({"dates": dates, "room": room, "teacher_line": clean})
+
+    # викладача, не указанного в конкретном варианте, берём из другого
+    # варианта той же ячейки (обычно он один на все варианты предмета)
+    shared_teacher = next((s["teacher_line"] for s in parsed_segments if s["teacher_line"]), "")
+
+    entries = []
+    for s in parsed_segments:
+        teacher_line = s["teacher_line"] or shared_teacher
+        tm = NAME_PATTERN.search(teacher_line)
+        teacher_key = tm.group(0).split()[0] if tm else teacher_line
+        if not subject_text and not teacher_line:
+            continue
+        entries.append({
+            "subject": subject_text,
+            "teacher_line": teacher_line,
+            "teacher_key": teacher_key,
+            "room": s["room"],
+            "url": url,
+            "dates": s["dates"],
+        })
+    return entries
 
 
 def _find_group_columns(table, group_name: str) -> list[int]:
@@ -398,18 +448,21 @@ def extract_group_schedule(doc_bytes: bytes, group_name: str) -> dict[int, dict]
                     merged_groups.append({"tc": cell._tc, "cell": cell, "positions": [pos + 1]})
 
             if len(merged_groups) == 1:
-                parsed = _parse_cell(merged_groups[0]["cell"])
-                if parsed and parsed["subject"]:
-                    parsed["time"] = time_text
-                    bucket["joint"].append(parsed)
+                for parsed in _parse_cell(merged_groups[0]["cell"]):
+                    if not parsed["subject"]:
+                        continue
+                    entry = dict(parsed)
+                    entry["time"] = time_text
+                    bucket["joint"].append(entry)
             else:
                 for g in merged_groups:
-                    parsed = _parse_cell(g["cell"])
-                    if not parsed or not parsed["subject"]:
-                        continue
-                    parsed["time"] = time_text
-                    for subgroup_num in g["positions"]:
-                        bucket["subgroups"][subgroup_num].append(parsed)
+                    for parsed in _parse_cell(g["cell"]):
+                        if not parsed["subject"]:
+                            continue
+                        entry = dict(parsed)
+                        entry["time"] = time_text
+                        for subgroup_num in g["positions"]:
+                            bucket["subgroups"][subgroup_num].append(entry)
 
     return raw
 

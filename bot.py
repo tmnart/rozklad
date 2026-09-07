@@ -7,8 +7,8 @@ Telegram-бот для оформления расписания пар.
    отформатированным сообщением с эмодзи и ссылкой на zoom.
 2. Присылаешь боту .docx-файл с расписанием (таблица на несколько групп,
    как выгружает деканат) — бот сам находит нужную группу, разбирает все
-   пары и отвечает готовым расписанием на день. Дату можно указать в
-   подписи к файлу (например "15.09"), иначе берётся сегодняшняя дата.
+   пары и отвечает готовым расписанием. Никакая дата не нужна — просто
+   присылай сам файл.
 
 Эмодзи для конкретных предметов и преподавателей, а также нужная группа —
 настраиваются прямо в чате командами, без правки кода.
@@ -29,7 +29,6 @@ import logging
 import os
 import re
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 
@@ -55,7 +54,6 @@ LINK_EMOJI = "💻"
 ROOM_EMOJI = "🚪"
 
 DEFAULT_GROUP = "ДХМоС-36"
-KYIV_TZ = timezone(timedelta(hours=3))
 
 # ---- ключевые слова учёных/преподавательских званий, по которым бот
 #      отделяет название предмета от преподавателя внутри одной строки.
@@ -85,7 +83,6 @@ TYPE_MARKERS_RE = re.compile(r"(Лек\.|Лаб\.|Пр\.|Сем\.|Конс\.|М�
 DATE_TOKEN_RE = re.compile(r"\b(\d{1,2})\.(\d{1,2})\b")
 ROOM_RE = re.compile(r"ауд\.?\s*([^\s,]+)", re.IGNORECASE)
 URLSAFE_RE = re.compile(r"^[A-Za-z0-9\-_./?=&%:]+$")
-DATE_IN_CAPTION_RE = re.compile(r"(\d{1,2})[.\-/](\d{1,2})")
 
 
 # ---------------------------------------------------------------------
@@ -302,39 +299,6 @@ def _entry_dates(text: str) -> list[str]:
     return sorted({f"{int(dd):02d}.{int(mm):02d}" for dd, mm in DATE_TOKEN_RE.findall(text)})
 
 
-def _all_dates_in_schedule(raw_entries: dict[int, dict]) -> set[str]:
-    all_dates: set[str] = set()
-    for bucket in raw_entries.values():
-        for entry in bucket["joint"]:
-            all_dates.update(entry["dates"])
-        for lst in bucket["subgroups"].values():
-            for entry in lst:
-                all_dates.update(entry["dates"])
-    return all_dates
-
-
-def _closest_date(dates: set[str], today) -> str | None:
-    """
-    Файл обычно расписан на один день недели на весь семестр (например,
-    только вторники) — из всех дат, что реально встречаются в файле,
-    берём ближайшую к сегодняшней (неважно, в прошлом она или в будущем).
-    Так бот сам понимает нужную неделю, без подписи к файлу.
-    """
-    best: str | None = None
-    best_diff: int | None = None
-    for d in dates:
-        try:
-            dd, mm = d.split(".")
-            candidate = today.replace(month=int(mm), day=int(dd))
-        except ValueError:
-            continue
-        diff = abs((candidate - today).days)
-        if best_diff is None or diff < best_diff:
-            best_diff = diff
-            best = d
-    return best
-
-
 def _strip_room(text: str) -> tuple[str, str]:
     """Возвращает (аудитория_из_первого_упоминания, текст_без_ВСЕХ_упоминаний_аудитории)."""
     m = ROOM_RE.search(text)
@@ -500,6 +464,10 @@ def extract_group_schedule(doc_bytes: bytes, group_name: str) -> dict[int, dict]
     return raw
 
 
+def _norm_subject(s: str) -> str:
+    return re.sub(r"\s+", " ", s.strip().lower())
+
+
 def _dedup_candidates(candidates: list[dict]) -> list[dict]:
     uniq: list[dict] = []
     seen = set()
@@ -513,18 +481,39 @@ def _dedup_candidates(candidates: list[dict]) -> list[dict]:
 
 def _pick_best(candidates: list[dict]) -> dict | None:
     """
-    Без привязки к дате: если для пары есть несколько вариантов (например,
+    Без привязки к дате: если для пары в файле несколько вариантов (например,
     лекція на одних датах и лабораторна на других), берём тот, что
-    встречается на большем числе дат (обычно это регулярно повторяющийся
-    формат на весь семестр, а не разовое занятие).
+    встречается на большем числе дат — обычно это основной, регулярно
+    повторяющийся формат на весь семестр, а не разовое занятие.
+
+    Ссылку на zoom и аудиторию часто пишут только один раз — например, в
+    самой первой (разовой) лекції, а дальше в регулярних лабораторних её
+    уже не повторяют. Если у выбранного варианта не хватает ссылки или
+    аудиторії, донабираем их из другого варианта того же предмета в этом
+    же списке.
     """
     uniq = _dedup_candidates(candidates)
     if not uniq:
         return None
     if len(uniq) == 1:
-        return uniq[0]
-    uniq_sorted = sorted(uniq, key=lambda c: len(c["dates"]), reverse=True)
-    return uniq_sorted[0]
+        best = uniq[0]
+    else:
+        uniq_sorted = sorted(uniq, key=lambda c: len(c["dates"]), reverse=True)
+        best = uniq_sorted[0]
+
+    if not best["url"] or not best["room"]:
+        subj_norm = _norm_subject(best["subject"])
+        filled = dict(best)
+        for c in uniq:
+            if _norm_subject(c["subject"]) != subj_norm:
+                continue
+            if not filled["url"] and c["url"]:
+                filled["url"] = c["url"]
+            if not filled["room"] and c["room"]:
+                filled["room"] = c["room"]
+        best = filled
+
+    return best
 
 
 def pick_schedule(
@@ -606,8 +595,9 @@ HELP_TEXT = (
     "оформлю его с эмодзи и красивой ссылкой на zoom.\n\n"
     "2️⃣ Пришли .docx-файл с расписанием (таблица на несколько групп) — сам "
     "найду настроенную группу и оформлю все пары. Никакая дата не нужна "
-    "вообще — просто присылай файл. Если у подгрупп разные пары — покажу "
-    "обе, с пометкой 🅰️ 1 підгрупа / 🅱️ 2 підгрупа.\n\n"
+    "вообще, подпись к файлу можно не писать — просто присылай сам файл. "
+    "Если у подгрупп разные пары — покажу обе, с пометкой "
+    "🅰️ 1 підгрупа / 🅱️ 2 підгрупа.\n\n"
     "Настройки:\n"
     "/setgroup <название группы> — какую группу доставать из .docx (сейчас: "
     f"«{data.get('group', DEFAULT_GROUP)}»)\n"

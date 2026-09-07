@@ -302,6 +302,39 @@ def _entry_dates(text: str) -> list[str]:
     return sorted({f"{int(dd):02d}.{int(mm):02d}" for dd, mm in DATE_TOKEN_RE.findall(text)})
 
 
+def _all_dates_in_schedule(raw_entries: dict[int, dict]) -> set[str]:
+    all_dates: set[str] = set()
+    for bucket in raw_entries.values():
+        for entry in bucket["joint"]:
+            all_dates.update(entry["dates"])
+        for lst in bucket["subgroups"].values():
+            for entry in lst:
+                all_dates.update(entry["dates"])
+    return all_dates
+
+
+def _closest_date(dates: set[str], today) -> str | None:
+    """
+    Файл обычно расписан на один день недели на весь семестр (например,
+    только вторники) — из всех дат, что реально встречаются в файле,
+    берём ближайшую к сегодняшней (неважно, в прошлом она или в будущем).
+    Так бот сам понимает нужную неделю, без подписи к файлу.
+    """
+    best: str | None = None
+    best_diff: int | None = None
+    for d in dates:
+        try:
+            dd, mm = d.split(".")
+            candidate = today.replace(month=int(mm), day=int(dd))
+        except ValueError:
+            continue
+        diff = abs((candidate - today).days)
+        if best_diff is None or diff < best_diff:
+            best_diff = diff
+            best = d
+    return best
+
+
 def _strip_room(text: str) -> tuple[str, str]:
     """Возвращает (аудитория_из_первого_упоминания, текст_без_ВСЕХ_упоминаний_аудитории)."""
     m = ROOM_RE.search(text)
@@ -478,71 +511,56 @@ def _dedup_candidates(candidates: list[dict]) -> list[dict]:
     return uniq
 
 
-def _pick_single(candidates: list[dict], target_date_str: str) -> tuple[dict | None, str | None]:
+def _pick_best(candidates: list[dict]) -> dict | None:
+    """
+    Без привязки к дате: если для пары есть несколько вариантов (например,
+    лекція на одних датах и лабораторна на других), берём тот, что
+    встречается на большем числе дат (обычно это регулярно повторяющийся
+    формат на весь семестр, а не разовое занятие).
+    """
     uniq = _dedup_candidates(candidates)
     if not uniq:
-        return None, None
-
-    exact = [c for c in uniq if target_date_str in c["dates"]]
-    if exact:
-        return exact[0], None
-
-    # точного совпадения нет — вариант без привязки к датам считаем
-    # действующим всегда
-    undated = [c for c in uniq if not c["dates"]]
-    if undated:
-        return undated[0], None
-
-    # все оставшиеся варианты жёстко привязаны к конкретным датам, и ни
-    # один не подошёл под нужный день
+        return None
     if len(uniq) == 1:
-        # единственная запись про эту пару, но именно на эту дату она не
-        # распространяется — скорее всего, в этот день пары просто нет
-        return None, None
-
-    # несколько дато-зависимых вариантов — берём самый вероятный (с самым
-    # длинным списком дат), но помечаем как неточный
+        return uniq[0]
     uniq_sorted = sorted(uniq, key=lambda c: len(c["dates"]), reverse=True)
-    return uniq_sorted[0], "uncertain"
+    return uniq_sorted[0]
 
 
-def pick_for_date(
-    raw_entries: dict[int, dict], target_date_str: str
-) -> dict[int, list[tuple[int | None, dict, str | None]]]:
+def pick_schedule(
+    raw_entries: dict[int, dict]
+) -> dict[int, list[tuple[int | None, dict]]]:
     """
-    Для каждой пары выбирает вариант(ы), которые действуют на нужную дату.
-    Возвращает пара -> список (номер_подгруппы_или_None, запись, пометка).
-    Если у пары есть подгруппы, но на выбранную дату их содержимое совпало —
-    отдаёт один общий вариант без пометки подгруппы. Если для какой-то
-    подгруппы на эту дату вообще ничего не нашлось — её просто не показываем
-    (а не приписываем ей чужую запись).
+    Для каждой пары выбирает по одному варианту на подгруппу — без всякой
+    привязки к дате, просто показываем расписание группы как оно есть в
+    файле. Если у подгрупп одинаковое содержимое — отдаём один общий
+    вариант без пометки подгруппы.
     """
-    result: dict[int, list[tuple[int | None, dict, str | None]]] = {}
+    result: dict[int, list[tuple[int | None, dict]]] = {}
     for pair_num, bucket in raw_entries.items():
         joint = bucket["joint"]
         subgroups = bucket["subgroups"]
         max_sg = bucket.get("max_subgroups", 1)
 
         if max_sg <= 1:
-            chosen, note = _pick_single(joint, target_date_str)
+            chosen = _pick_best(joint)
             if chosen:
-                result[pair_num] = [(None, chosen, note)]
+                result[pair_num] = [(None, chosen)]
             continue
 
-        picks: list[tuple[int, dict, str | None]] = []
+        picks: list[tuple[int, dict]] = []
         contents = set()
         for sg in range(1, max_sg + 1):
-            chosen, note = _pick_single(joint + subgroups.get(sg, []), target_date_str)
+            chosen = _pick_best(joint + subgroups.get(sg, []))
             if chosen:
-                picks.append((sg, chosen, note))
+                picks.append((sg, chosen))
                 contents.add((chosen["subject"], chosen["teacher_line"], chosen["room"], chosen["url"]))
 
         if not picks:
             continue
         if len(picks) == max_sg and len(contents) <= 1:
-            # у всех подгрупп нашлось что-то, и оно одинаковое — это общая пара
-            sg0, chosen0, note0 = picks[0]
-            result[pair_num] = [(None, chosen0, note0)]
+            sg0, chosen0 = picks[0]
+            result[pair_num] = [(None, chosen0)]
         else:
             result[pair_num] = picks
 
@@ -587,10 +605,9 @@ HELP_TEXT = (
     "1️⃣ Пришли текст расписания (можно сразу за несколько пар подряд) — "
     "оформлю его с эмодзи и красивой ссылкой на zoom.\n\n"
     "2️⃣ Пришли .docx-файл с расписанием (таблица на несколько групп) — сам "
-    "найду настроенную группу и оформлю все пары на день. Чтобы выбрать дату, "
-    "укажи её в подписи к файлу, например «15.09» — иначе возьму сегодняшнюю. "
-    "Если в этот день у подгрупп разные пары — покажу обе, с пометкой "
-    "🅰️ 1 підгрупа / 🅱️ 2 підгрупа.\n\n"
+    "найду настроенную группу и оформлю все пары. Никакая дата не нужна "
+    "вообще — просто присылай файл. Если у подгрупп разные пары — покажу "
+    "обе, с пометкой 🅰️ 1 підгрупа / 🅱️ 2 підгрупа.\n\n"
     "Настройки:\n"
     "/setgroup <название группы> — какую группу доставать из .docx (сейчас: "
     f"«{data.get('group', DEFAULT_GROUP)}»)\n"
@@ -707,15 +724,6 @@ async def handle_document(message: Message) -> None:
         await message.answer("Пришли файл в формате .docx с таблицей расписания.")
         return
 
-    caption = (message.caption or "").strip()
-    dm = DATE_IN_CAPTION_RE.search(caption)
-    if dm:
-        dd, mm = int(dm.group(1)), int(dm.group(2))
-    else:
-        now = datetime.now(KYIV_TZ)
-        dd, mm = now.day, now.month
-    target_date_str = f"{dd:02d}.{mm:02d}"
-
     group_name = data.get("group", DEFAULT_GROUP)
 
     try:
@@ -735,29 +743,17 @@ async def handle_document(message: Message) -> None:
         await message.answer(f"Не нашёл группу «{group_name}» в этом файле.")
         return
 
-    picked = pick_for_date(entries, target_date_str)
+    picked = pick_schedule(entries)
     blocks = []
-    uncertain_labels = []
     for pair_num in sorted(picked):
-        for subgroup, entry, note in picked[pair_num]:
+        for subgroup, entry in picked[pair_num]:
             blocks.append(format_docx_entry(pair_num, entry, subgroup))
-            if note == "uncertain":
-                label = str(pair_num)
-                if subgroup is not None:
-                    label += f" ({SUBGROUP_LABEL.get(subgroup, subgroup)})"
-                uncertain_labels.append(label)
 
     if not blocks:
         await message.answer(f"Не нашёл ни одной пары для группы «{group_name}» в файле.")
         return
 
-    text = f"Розклад для {group_name} на {target_date_str}:\n\n" + "\n\n".join(blocks)
-    if uncertain_labels:
-        pairs_str = ", ".join(uncertain_labels)
-        text += (
-            f"\n\n⚠️ Для пари(-ар) {pairs_str} не знайшов точну дату в файлі — "
-            "показав типовий запис, звір вручну."
-        )
+    text = f"Розклад для {group_name}:\n\n" + "\n\n".join(blocks)
 
     try:
         await message.answer(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
